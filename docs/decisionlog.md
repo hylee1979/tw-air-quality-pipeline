@@ -1,41 +1,72 @@
+# Decision log
+
+## Fact table shape
 
 I use long table because it's easier to add new pollutants. We don't need to change schema.
 
-fact_pollution_concentration
-id BIGSERIAL PRIMARY KEY -> easier for engineering
-UNIQUE (site_id, publishtime, target_id) -> promise the idempotancy
-fact_aqi
-id BIGSERIAL PRIMARY KEY -> easier for engineering
-UNIQUE (site_id, publishtime) -> promise the idempotancy
-fact_weather
-id BIGSERIAL PRIMARY KEY -> easier for engineering
-UNIQUE (station_id, publishtime) -> promise the idempotancy
+## Keys and idempotency
 
-use timestamptz, becasue we have different data sources, in case their time format is different.
-決定在fact table 保留原始publishtime，為了audit/debugging方便，後續如果要計算時間距離等等也比較方便
+Every fact table gets a `BIGSERIAL` surrogate key, because it's easier for engineering.
+Uniqueness is enforced by a `UNIQUE` constraint on the natural key, which promises the idempotency.
 
-the type of concentration is numeric rather than float, because we need to compare it to legal limit. we need it to be accurate. 
+| table | primary key | unique constraint |
+|---|---|---|
+| fact_pollution_concentration | id BIGSERIAL | (site_id, publishtime, target_id) |
+| fact_aqi | id BIGSERIAL | (site_id, publishtime) |
+| fact_weather | id BIGSERIAL | (station_id, publishtime) |
 
-need other data source:
-is_holiday, legal_limit
+## Time handling
 
-we need to find the nearest station of each aqi site beforehand, using longitude and latitude.
+Use `timestamptz`, because we have different data sources, in case their time format is different.
 
-aqi uses TWD97 so we choose to use weather station's WGS84. their difference in at centimeter level.
-data from [AQX_P_07](https://data.moenv.gov.tw/dataset/detail/AQX_P_07)
+決定在 fact table 保留原始 publishtime，為了 audit 和 debugging 方便。後續如果要計算時間距離等等也比較方便。
 
-precipitation is the accumulated precipitation of that day
-https://opendata.cwa.gov.tw/opendatadoc/Observation/O-A0001-001.pdf
+## Data types
 
-null: 
--99 for weather station
-"" for aqi data
-all convert to NULL before loading
+The type of concentration is `numeric` rather than `float`, because we need to compare it to legal limit. We need it to be accurate.
 
-both aqi and weather data have wind speed and direction. we use the ones from aqi data because we ask questions around aqi.
+## External data needed
 
-avg_window the unit is hour
-avg_window change to text because it's only a description for people. we don't use it to compute. 
+These columns are not in the source APIs and need another data source:
 
-aqi level refers to https://airtw.moenv.gov.tw/CHT/Information/Standard/AirQualityIndicator.aspx
+- `is_holiday`
+- `legal_limit`
 
+## Nearest weather station
+
+We need to find the nearest station of each aqi site beforehand, using longitude and latitude.
+
+## Coordinate system
+
+aqi uses TWD97, so we choose to use weather station's WGS84. Their difference is at centimeter level.
+
+Source: [AQX_P_07](https://data.moenv.gov.tw/dataset/detail/AQX_P_07)
+
+## Precipitation
+
+precipitation is the accumulated precipitation of that day.
+
+Source: [O-A0001-001 doc (PDF)](https://opendata.cwa.gov.tw/opendatadoc/Observation/O-A0001-001.pdf)
+
+## Null handling
+
+Each source marks missing values differently. All of them convert to `NULL` before loading.
+
+| source | missing value |
+|---|---|
+| weather station | `-99` |
+| aqi data | `""` |
+
+## Wind data source
+
+Both aqi and weather data have wind speed and direction. We use the ones from aqi data, because we ask questions around aqi.
+
+## avg_window
+
+The unit is hour.
+
+`avg_window` changed to `text`, because it's only a description for people. We don't use it to compute.
+
+## AQI levels
+
+aqi level refers to [空氣品質指標｜環境部](https://airtw.moenv.gov.tw/CHT/Information/Standard/AirQualityIndicator.aspx)
