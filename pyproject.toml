@@ -1,0 +1,20 @@
+[project]
+name = "tw-air-quality-pipeline"
+version = "0.1.0"
+description = "An hourly data pipeline that ingests Taiwan's public air-quality and weather station readings, lands the raw JSON, loads it into a PostgreSQL warehouse modelled as a star schema, tests data quality, flags anomalies, and is orchestrated by Airflow."
+readme = "README.md"
+authors = [
+    { name = "hylee", email = "dryad1979@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "python-dotenv>=1.2.1",
+    "requests>=2.32.5",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "aqi_pipeline"
