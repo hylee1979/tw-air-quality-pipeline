@@ -247,7 +247,12 @@ the load idempotent.
 The station master payload carries no timestamp of its own, so there is no data hour to key on. Its
 identity is its content instead: the grain is one row per distinct version, and uniqueness is
 `(source, sha256)`. A monthly fetch that finds nothing changed collides with the row already stored; a
-fetch that finds a change inserts a new one.
+fetch that finds a change inserts a new one. The digest is stored as `text`, in hex, because nothing
+compares it inside SQL.
+
+The hourly table carries no digest. One would reveal an hour whose bytes changed between two fetches,
+but nothing in the project needs to answer that yet, and the file layer has already given that
+evidence up by overwriting.
 
 Keying on the digest rather than on the fetch time has a useful side effect. The table becomes a
 version history of the station master data, which is the raw material for giving `dim_site` slowly
@@ -270,9 +275,16 @@ For the reference table the question does not arise in the same way. A conflict 
 digest already exists, so the stored payload is byte-identical to the incoming one and there is
 nothing to replace.
 
+Its timestamp is therefore a `first_seen`, written once when a version appears, rather than a fetch
+time that moves on every run. That answers when a given version appeared, and, taking the newest row,
+when the master data last changed. It does not answer when a version was last confirmed unchanged:
+that would need a `last_seen` that every fetch touches, and nothing needs it yet.
+
 ### Database schemas
 
-Two schemas in PostgreSQL: `raw` for the landing tables and `marts` for the star schema.
+Two schemas in PostgreSQL: `raw` for the landing tables and `marts` for the star schema. Table names
+are written with the schema throughout `docs/schema.md`, so that the DDL and the documentation agree
+on where each table lives.
 
 A schema is a namespace. Separating the two now gives a natural boundary for the roles and grants
 later in phase 1, where a reader can be granted `marts` without being granted `raw`.

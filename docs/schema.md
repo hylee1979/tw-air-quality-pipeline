@@ -2,21 +2,56 @@
 
 ## Raw layer
 
-### raw
+Two tables in the `raw` schema. They are separate because their grains differ: an hourly reading is
+identified by the hour it describes, whereas the station master carries no time of its own and is
+identified by its content.
 
-**grain**: the payload of aqi or weather query each time
+### raw.hourly_payload
+
+**grain**: one row per source per data hour
 
 | column | type | key | note |
 |---|---|---|---|
 | id | bigint | PK | |
-| json | jsonb | | |
-| data_datetime | timestamptz | | 資料紀錄的時間 |
+| source | text | UQ | |
+| data_datetime | timestamptz | UQ | 資料紀錄的時間 |
 | fetched_datetime | timestamptz | | 我們抓取的時間 |
-| source | text | | |
+| json | jsonb | | the response, stored unchanged |
+
+`UNIQUE (source, data_datetime)` is what makes the load idempotent: re-loading an hour addresses the
+row already there. Both key columns are therefore NOT NULL.
+
+This table carries no digest of the payload. One would reveal an hour whose bytes changed between two
+fetches, but nothing in the project needs to answer that yet.
+
+### raw.reference_payload
+
+**grain**: one row per distinct version of a reference payload
+
+| column | type | key | note |
+|---|---|---|---|
+| id | bigint | PK | |
+| source | text | UQ | |
+| sha256 | text | UQ | digest of the payload, hex |
+| first_seen | timestamptz | | 第一次看到這個版本的時間 |
+| json | jsonb | | the response, stored unchanged |
+
+`UNIQUE (source, sha256)` means a monthly fetch that finds nothing changed collides with the stored
+row, and only a real change inserts a new one. The table is therefore a version history of the
+station master data, which is the raw material for giving `dim_site` slowly changing dimension
+history later.
+
+There is no `data_datetime` here. Keying on a nullable column would not work, because a UNIQUE
+constraint treats NULLs as distinct from one another.
+
+A row is written the first time a version appears, so its timestamp is a `first_seen` rather than a
+fetch time. Two questions fall out of it: when a given version appeared, and, from the newest row,
+when the master data last changed. A third question it cannot answer is when a version was last
+confirmed unchanged, which would need a `last_seen` that every fetch touches.
 
 ## Star schema
 
-### fact_pollution_concentration
+### marts.fact_pollution_concentration
 
 **grain**: the concentration or avg concentration of a pollutant at a site at an hour
 
@@ -30,7 +65,7 @@
 | time_id | time | FK | |
 | concentration | numeric(6,2) | | not additive |
 
-### fact_aqi
+### marts.fact_aqi
 
 **grain**: the data of a site at an hour, including aqi and wind
 
@@ -47,7 +82,7 @@
 | wind_speed | float | | not additive |
 | wind_direc | int | | not additive |
 
-### fact_weather
+### marts.fact_weather
 
 **grain**: the hourly weather data of a weather station
 
@@ -68,7 +103,7 @@
 
 ## Dimension tables
 
-### dim_site
+### marts.dim_site
 
 Source: should come from [AQX_P_07](https://data.moenv.gov.tw/dataset/detail/AQX_P_07)
 
@@ -85,7 +120,7 @@ Source: should come from [AQX_P_07](https://data.moenv.gov.tw/dataset/detail/AQX
 | sitetype | text | | |
 | station_id | text | FK | the nearest station of that site |
 
-### dim_weather_station
+### marts.dim_weather_station
 
 | column | type | key | note |
 |---|---|---|---|
@@ -99,7 +134,7 @@ Source: should come from [AQX_P_07](https://data.moenv.gov.tw/dataset/detail/AQX
 | countycode | int | | |
 | towncode | int | | |
 
-### dim_pollutant
+### marts.dim_pollutant
 
 | column | type | key | note |
 |---|---|---|---|
@@ -113,7 +148,7 @@ Source: should come from [AQX_P_07](https://data.moenv.gov.tw/dataset/detail/AQX
 
 Note: here o3 and o3_8hr have different id.
 
-### dim_aqi_level
+### marts.dim_aqi_level
 
 | column | type | key | note |
 |---|---|---|---|
@@ -122,7 +157,7 @@ Note: here o3 and o3_8hr have different id.
 | lower_bound | int | | |
 | upper_bound | int | | |
 
-### dim_date
+### marts.dim_date
 
 | column | type | key | note |
 |---|---|---|---|
@@ -135,7 +170,7 @@ Note: here o3 and o3_8hr have different id.
 | is_weekend | bool | | |
 | is_holiday | bool | | |
 
-### dim_time
+### marts.dim_time
 
 | column | type | key | note |
 |---|---|---|---|
