@@ -34,6 +34,7 @@ fetches, but nothing in the project needs to answer that yet.
 | source | text | UQ | |
 | sha256 | text | UQ | digest of the payload, hex |
 | first_seen | timestamptz | | 第一次看到這個版本的時間 |
+| fetched_datetime | timestamptz | | 最近一次看到這個版本的時間 |
 | json | jsonb | | the response, stored unchanged |
 
 `UNIQUE (source, sha256)` means a monthly fetch that finds nothing changed collides with the stored
@@ -44,10 +45,12 @@ history later.
 There is no `data_datetime` here. Keying on a nullable column would not work, because a UNIQUE
 constraint treats NULLs as distinct from one another.
 
-A row is written the first time a version appears, so its timestamp is a `first_seen` rather than a
-fetch time. Two questions fall out of it: when a given version appeared, and, from the newest row,
-when the master data last changed. A third question it cannot answer is when a version was last
-confirmed unchanged, which would need a `last_seen` that every fetch touches.
+The two timestamps do different jobs. `first_seen` is written once, when a version appears, and never
+moves. `fetched_datetime` is moved forward by every fetch that lands on the row, so it reads as the
+last time the version was seen.
+
+Three questions fall out of that pair: when a given version appeared, when it was last confirmed
+unchanged, and, from the newest row, when the master data last changed.
 
 ## Star schema
 

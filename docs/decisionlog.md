@@ -271,14 +271,14 @@ For the hourly table, on conflict update: the newer payload replaces the stored 
 This follows the landing zone, where a repeated fetch overwrites the file. Both layers therefore hold
 the most recent answer for a given hour, not a history of answers for it.
 
-For the reference table the question does not arise in the same way. A conflict there means the
-digest already exists, so the stored payload is byte-identical to the incoming one and there is
-nothing to replace.
+For the reference table a conflict means the digest already exists, so the stored payload is
+byte-identical to the incoming one and the payload itself has nothing to replace. The conflict still
+does work, though: it moves `fetched_datetime` forward, leaving `first_seen` alone.
 
-Its timestamp is therefore a `first_seen`, written once when a version appears, rather than a fetch
-time that moves on every run. That answers when a given version appeared, and, taking the newest row,
-when the master data last changed. It does not answer when a version was last confirmed unchanged:
-that would need a `last_seen` that every fetch touches, and nothing needs it yet.
+So the reference table keeps two timestamps for a reason. `first_seen` says when a version appeared
+and never moves; `fetched_datetime` says when it was last seen. Between them, and with the newest row
+giving the date of the last real change, the table answers when the master data changed and when it
+was last confirmed not to have.
 
 ### Database schemas
 
