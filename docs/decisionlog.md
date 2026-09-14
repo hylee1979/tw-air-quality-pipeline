@@ -71,6 +71,47 @@ The unit is hour.
 
 aqi level refers to [空氣品質指標｜環境部](https://airtw.moenv.gov.tw/CHT/Information/Standard/AirQualityIndicator.aspx)
 
+## Source behaviour
+
+### Staleness of the air quality feed
+
+Found while implementing `extract.py`: the hourly air quality feed was not current. Its latest
+`publishtime` was 2026-09-11 21:00 while the clock read 2026-09-13 12:22, around 39 hours behind.
+The weather feed was current at the same moment.
+
+This is the source, not the pipeline. The platform's own dataset page reported the same last-updated
+time, 2026-09-11 21:15:03.
+
+Two things follow. The landing zone behaves correctly under it, because a file is named by the hour
+of the data, so a stale feed rewrites one file rather than inventing new hours. And the freshness
+threshold cannot be taken from the platform's nominal hourly cadence: a two-hour threshold would
+alert continuously. The real distribution of gaps has to come from the historical dataset once it is
+backfilled, so that the threshold reflects what the source does rather than what it promises.
+
+### Stations missing from the master data
+
+The hourly feed reports 84 stations. The station master, AQX_P_07, lists 80. Four stations appear
+only in the hourly feed:
+
+| siteid | name |
+|---|---|
+| 203 | 南投（鹿谷） |
+| 204 | 屏東（琉球） |
+| 311 | 新北（樹林） |
+| 313 | 屏東（枋山） |
+
+A `dim_site` built from the master alone would therefore have no row for four of the sites the fact
+tables reference.
+
+Those sites are stored anyway. The hourly feed itself carries `sitename`, `county` and the
+coordinates, so those fields are populated from it, and only the fields the master alone provides
+are left NULL: `areaname`, `township`, `siteaddress`, `sitetype` and `siteengname`. The questions
+this project answers need the basic station attributes, not the full master record.
+
+Kimball calls a dimension row created this way an inferred member. The fact arrived before the
+dimension, so a partial row is written rather than dropping the fact or letting the foreign key
+fail.
+
 ## Extractor
 
 ### One source per run
@@ -90,9 +131,13 @@ data/raw/source=<name>/year=2026/month=09/day=12/hour<HH>.json
 Month and day are zero-padded. Object stores list keys in lexicographic order, so `month=9` would
 sort after `month=10`; the same layout moves to S3 unchanged in phase 4.
 
-The file name is derived from the hour of the **data**, not the hour of the pull, so re-running an
-hour lands on the same file. Naming by pull time instead would leave a new file behind on every run,
-which would make the overwrite rule below meaningless and would break re-runs during backfill.
+This is the shape for the hourly feeds. The timestamp in it is the hour of the **data**, not the hour
+of the pull, so re-running an hour lands on the same file. Naming them by pull time instead would
+leave a new file behind on every run, which would make the overwrite rule below meaningless and would
+break re-runs during backfill.
+
+The station master uses a shorter path and is timestamped by the pull. Both differences are explained
+under "Cadence of static sources".
 
 ### Re-running the same hour
 
@@ -157,7 +202,102 @@ It gets its own schedule, pulled monthly, which in phase 3 means a second DAG ra
 task on the hourly one. How often a source is pulled follows from how fast it changes, not from the
 cadence of the facts it describes.
 
-This source lands at `year=<YYYY>/month<MM>.json`, which holds one snapshot per month: a second
-pull inside the same month replaces the first. That still gives a month-by-month history of the
-station master data for free, even while `dim_site` itself keeps no history. Preserving every
-individual pull would mean putting the pull date in the file name as well.
+This source lands one file per month, `year=2026/month09.json`, with the month taken from the pull
+time because the payload carries no time of its own. A second pull inside the same month replaces the
+first; across months each pull is kept, so the file layer holds a month-by-month history.
+
+Going finer than the month would buy nothing here. The version history that matters is in the raw
+reference table, which keys on the digest and therefore records every distinct version of the master
+data however often it is pulled.
+
+### Recording the pull time
+
+The raw table carries a `pull_datetime`, but nothing produced so far holds one. The file name is the
+hour of the data, and the bytes are stored exactly as the API sent them.
+
+The extractor therefore writes a small metadata file alongside each payload, recording the moment
+the response came back, read immediately after the request returns rather than at the end of the
+run.
+
+The metadata file sits beside the payload and is named after it, `hour<HH>.metadata.json`. It
+records the pull time, the SHA-256 of the payload, and the source.
+
+The digest is there so that a later pull can be compared against a stored one without reading the
+whole body. That matters most for the station master data, where the point of pulling monthly is to
+find out whether anything changed at all.
+
+The metadata file is named after the payload it describes, so it follows whatever shape that payload
+uses: `hour<HH>.metadata.json` beside an hourly file, `month<MM>.metadata.json` beside the station
+master.
+
+Still to fix: the HTTP status and the byte count are also worth keeping, since those are the first
+things to look at when an hour looks wrong. The URL is not, because it carries the key.
+
+## Raw layer
+
+### Grain and uniqueness
+
+The hourly readings and the reference data go into separate tables in the `raw` schema, for the same
+reason that `fact_aqi` and `fact_weather` are separate: their grains differ.
+
+For the hourly payloads the grain is one row per source per data hour, and uniqueness is
+`(source, data_datetime)`. Loading the same hour twice addresses the same row, and that is what makes
+the load idempotent.
+
+The station master payload carries no timestamp of its own, so there is no data hour to key on. Its
+identity is its content instead: the grain is one row per distinct version, and uniqueness is
+`(source, sha256)`. A monthly pull that finds nothing changed collides with the row already stored; a
+pull that finds a change inserts a new one.
+
+Keying on the digest rather than on the pull time has a useful side effect. The table becomes a
+version history of the station master data, which is the raw material for giving `dim_site` slowly
+changing dimension history later on.
+
+An earlier draft put both kinds of payload in one table with a nullable `data_datetime`. That does
+not work. A UNIQUE constraint treats NULLs as distinct from one another, so nothing would stop
+unlimited duplicate rows for the source whose key is NULL. PostgreSQL 15 can override this with
+`UNIQUE NULLS NOT DISTINCT`, but resting a key constraint on that detail is not worth it when the
+grains differ anyway.
+
+### Conflict behaviour
+
+For the hourly table, on conflict update: the newer payload replaces the stored one.
+
+This follows the landing zone, where a repeated pull overwrites the file. Both layers therefore hold
+the most recent answer for a given hour, not a history of answers for it.
+
+For the reference table the question does not arise in the same way. A conflict there means the
+digest already exists, so the stored payload is byte-identical to the incoming one and there is
+nothing to replace.
+
+### Database schemas
+
+Two schemas in PostgreSQL: `raw` for the landing tables and `marts` for the star schema.
+
+A schema is a namespace. Separating the two now gives a natural boundary for the roles and grants
+later in phase 1, where a reader can be granted `marts` without being granted `raw`.
+
+## Loader
+
+### Selecting what to load
+
+The loader takes the source and the period as arguments and loads only what it was asked for. It
+does not scan the landing zone looking for files it has not seen.
+
+This makes a re-run or a backfill a matter of passing a different period, and it maps directly onto
+an Airflow task, which always knows the interval it is running for.
+
+It does not, by itself, guarantee that every file in the landing zone has reached the database:
+nothing notices a period that was never requested. That needs a separate reconciliation check,
+comparing the files present against the rows in `raw`. Still to decide: whether it runs as its own
+step or as one of the data quality tests.
+
+### Partial failure
+
+When a run covers several periods and one of them fails, the successful ones stay committed and only
+the failures are re-run. The transaction boundary is one file, not the whole batch.
+
+Two things follow. The process must still exit non-zero when any file failed, or the caller has no
+reason to retry. And it must name the periods that failed, or the caller has no way to know what to
+retry.
+
