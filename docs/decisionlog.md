@@ -132,11 +132,11 @@ Month and day are zero-padded. Object stores list keys in lexicographic order, s
 sort after `month=10`; the same layout moves to S3 unchanged in phase 4.
 
 This is the shape for the hourly feeds. The timestamp in it is the hour of the **data**, not the hour
-of the pull, so re-running an hour lands on the same file. Naming them by pull time instead would
+of the fetch, so re-running an hour lands on the same file. Naming them by fetch time instead would
 leave a new file behind on every run, which would make the overwrite rule below meaningless and would
 break re-runs during backfill.
 
-The station master uses a shorter path and is timestamped by the pull. Both differences are explained
+The station master uses a shorter path and is timestamped by the fetch. Both differences are explained
 under "Cadence of static sources".
 
 ### Re-running the same hour
@@ -198,21 +198,21 @@ was edited by hand. Station coverage is a data quality question, not an extracti
 The air quality station master data, AQX_P_07, is effectively static and does not need the hourly
 cadence of the readings.
 
-It gets its own schedule, pulled monthly, which in phase 3 means a second DAG rather than an extra
-task on the hourly one. How often a source is pulled follows from how fast it changes, not from the
+It gets its own schedule, fetched monthly, which in phase 3 means a second DAG rather than an extra
+task on the hourly one. How often a source is fetched follows from how fast it changes, not from the
 cadence of the facts it describes.
 
-This source lands one file per month, `year=2026/month09.json`, with the month taken from the pull
-time because the payload carries no time of its own. A second pull inside the same month replaces the
-first; across months each pull is kept, so the file layer holds a month-by-month history.
+This source lands one file per month, `year=2026/month09.json`, with the month taken from the fetch
+time because the payload carries no time of its own. A second fetch inside the same month replaces the
+first; across months each fetch is kept, so the file layer holds a month-by-month history.
 
 Going finer than the month would buy nothing here. The version history that matters is in the raw
 reference table, which keys on the digest and therefore records every distinct version of the master
-data however often it is pulled.
+data however often it is fetched.
 
-### Recording the pull time
+### Recording the fetch time
 
-The raw table carries a `pull_datetime`, but nothing produced so far holds one. The file name is the
+The raw table carries a `fetched_datetime`, but nothing produced so far holds one. The file name is the
 hour of the data, and the bytes are stored exactly as the API sent them.
 
 The extractor therefore writes a small metadata file alongside each payload, recording the moment
@@ -220,10 +220,10 @@ the response came back, read immediately after the request returns rather than a
 run.
 
 The metadata file sits beside the payload and is named after it, `hour<HH>.metadata.json`. It
-records the pull time, the SHA-256 of the payload, and the source.
+records the fetch time, the SHA-256 of the payload, and the source.
 
-The digest is there so that a later pull can be compared against a stored one without reading the
-whole body. That matters most for the station master data, where the point of pulling monthly is to
+The digest is there so that a later fetch can be compared against a stored one without reading the
+whole body. That matters most for the station master data, where the point of fetching monthly is to
 find out whether anything changed at all.
 
 The metadata file is named after the payload it describes, so it follows whatever shape that payload
@@ -246,10 +246,10 @@ the load idempotent.
 
 The station master payload carries no timestamp of its own, so there is no data hour to key on. Its
 identity is its content instead: the grain is one row per distinct version, and uniqueness is
-`(source, sha256)`. A monthly pull that finds nothing changed collides with the row already stored; a
-pull that finds a change inserts a new one.
+`(source, sha256)`. A monthly fetch that finds nothing changed collides with the row already stored; a
+fetch that finds a change inserts a new one.
 
-Keying on the digest rather than on the pull time has a useful side effect. The table becomes a
+Keying on the digest rather than on the fetch time has a useful side effect. The table becomes a
 version history of the station master data, which is the raw material for giving `dim_site` slowly
 changing dimension history later on.
 
@@ -263,7 +263,7 @@ grains differ anyway.
 
 For the hourly table, on conflict update: the newer payload replaces the stored one.
 
-This follows the landing zone, where a repeated pull overwrites the file. Both layers therefore hold
+This follows the landing zone, where a repeated fetch overwrites the file. Both layers therefore hold
 the most recent answer for a given hour, not a history of answers for it.
 
 For the reference table the question does not arise in the same way. A conflict there means the

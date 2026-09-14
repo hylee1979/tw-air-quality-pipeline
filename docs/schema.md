@@ -11,7 +11,7 @@
 | id | bigint | PK | |
 | json | jsonb | | |
 | data_datetime | timestamptz | | 資料紀錄的時間 |
-| pull_datetime | timestamptz | | 我們抓取的時間 |
+| fetched_datetime | timestamptz | | 我們抓取的時間 |
 | source | text | | |
 
 ## Star schema

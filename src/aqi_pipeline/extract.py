@@ -15,6 +15,7 @@ The decisions this module implements are recorded in docs/decisionlog.md under
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -74,8 +75,25 @@ def _cwa_observation_time(document: Any) -> datetime:
 
 
 @dataclass(frozen=True)
+class Fetched:
+    """One successful call.
+
+    Attributes:
+        payload: The response body, byte for byte as the API sent it.
+        document: The same body parsed, kept only so that the data hour can be
+            read without parsing twice.
+        fetched_at: The moment the response came back, read immediately after the
+            request returned rather than at the end of the run.
+    """
+
+    payload: bytes
+    document: Any
+    fetched_at: datetime
+
+
+@dataclass(frozen=True)
 class Source:
-    """One API this module knows how to pull.
+    """One API this module knows how to fetch.
 
     Attributes:
         name: Short slug used in the landing-zone path.
@@ -85,9 +103,9 @@ class Source:
             platform uses Authorization.
         key_env: Environment variable holding the key.
         granularity: "hour" for the readings, "month" for the station master
-            data, which is effectively static and pulled on its own schedule.
+            data, which is effectively static and fetched on its own schedule.
         data_time: Reads the hour the data describes out of the parsed payload.
-            None for a source that carries no timestamp, in which case the pull
+            None for a source that carries no timestamp, in which case the fetch
             time is used instead.
         params: Extra query parameters. A limit is sent explicitly so that a
             change to the platform default cannot silently truncate the result.
@@ -139,7 +157,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--source",
         required=True,
         choices=sorted(SOURCES),
-        help="which API to pull; one source per run",
+        help="which API to fetch; one source per run",
     )
     parser.add_argument(
         "--landing-root",
@@ -172,12 +190,11 @@ def build_session() -> requests.Session:
     return session
 
 
-def fetch(session: requests.Session, source: Source, api_key: str) -> tuple[bytes, Any]:
-    """Call the source once and return its body unchanged, plus the parsed form.
+def fetch(session: requests.Session, source: Source, api_key: str) -> Fetched:
+    """Call the source once and return its body unchanged, plus what came with it.
 
     The bytes are what gets written to disk, so they must stay byte-identical to
-    what the API sent. The parsed document is returned alongside only so that the
-    data hour can be read without parsing twice.
+    what the API sent.
 
     A run succeeds on a 2xx whose body parses as JSON. Coverage is not checked
     here: a short station list is a data quality question, not an extract
@@ -185,6 +202,7 @@ def fetch(session: requests.Session, source: Source, api_key: str) -> tuple[byte
     """
     params = {**source.params, source.key_param: api_key}
     response = session.get(source.url, params=params, timeout=TIMEOUT)
+    fetched_at = datetime.now(tz=TAIPEI)
     response.raise_for_status()
 
     payload = response.content
@@ -195,7 +213,7 @@ def fetch(session: requests.Session, source: Source, api_key: str) -> tuple[byte
         response.status_code,
         len(payload),
     )
-    return payload, document
+    return Fetched(payload=payload, document=document, fetched_at=fetched_at)
 
 
 def target_path(root: Path, source: Source, stamp: datetime) -> Path:
@@ -218,8 +236,36 @@ def target_path(root: Path, source: Source, stamp: datetime) -> Path:
     return base / f"month={stamp:%m}" / f"day={stamp:%d}" / f"hour{stamp:%H}.json"
 
 
-def write_payload(path: Path, payload: bytes) -> None:
-    """Write the raw bytes, replacing any existing file for that period.
+def metadata_path(payload_path: Path) -> Path:
+    """Name the metadata file after the payload it describes.
+
+    hour12.json is accompanied by hour12.metadata.json, month09.json by
+    month09.metadata.json.
+    """
+    return payload_path.with_suffix(".metadata.json")
+
+
+def build_metadata(source: Source, fetched: Fetched) -> bytes:
+    """Describe one fetch.
+
+    The payload itself cannot hold this: the bytes are stored unchanged, and the
+    file name is the hour of the data, so nothing in the landing zone would
+    otherwise record when the fetch happened.
+
+    The digest lets a later fetch be compared against a stored one without reading
+    the whole body, which is what makes a monthly reference fetch cheap to check
+    for changes.
+    """
+    document = {
+        "source": source.name,
+        "fetched_at": fetched.fetched_at.isoformat(timespec="seconds"),
+        "sha256": hashlib.sha256(fetched.payload).hexdigest(),
+    }
+    return json.dumps(document, indent=2).encode() + b"\n"
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    """Write bytes, replacing whatever was there before.
 
     The write goes to a temporary file in the same directory and is then renamed
     into place. os.replace is atomic within a filesystem, so a crash midway
@@ -229,7 +275,7 @@ def write_payload(path: Path, payload: bytes) -> None:
     handle, temporary = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with os.fdopen(handle, "wb") as file:
-            file.write(payload)
+            file.write(data)
         os.replace(temporary, path)
     except BaseException:
         Path(temporary).unlink(missing_ok=True)
@@ -253,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
 
     session = build_session()
     try:
-        payload, document = fetch(session, source, api_key)
+        fetched = fetch(session, source, api_key)
     except requests.RequestException as error:
         # str(error) can contain the full URL, and the URL carries the key.
         logger.error("fetch failed source=%s error=%s", source.name, type(error).__name__)
@@ -266,16 +312,18 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         stamp = (
-            source.data_time(document)
+            source.data_time(fetched.document)
             if source.data_time
-            else datetime.now(tz=TAIPEI)
+            else fetched.fetched_at
         )
     except (KeyError, TypeError, ValueError) as error:
         logger.error("could not read the data time source=%s error=%s", source.name, error)
         return 1
 
+    # The payload goes first: it is the part that cannot be obtained again.
     path = target_path(args.landing_root, source, stamp)
-    write_payload(path, payload)
+    write_atomic(path, fetched.payload)
+    write_atomic(metadata_path(path), build_metadata(source, fetched))
     logger.info(
         "landed source=%s data_time=%s path=%s",
         source.name,
