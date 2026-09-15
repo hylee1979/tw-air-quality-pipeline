@@ -16,7 +16,7 @@ identified by its content.
 | source | text | UQ | |
 | data_datetime | timestamptz | UQ | 資料紀錄的時間 |
 | fetched_datetime | timestamptz | | 我們抓取的時間 |
-| json | jsonb | | the response, stored unchanged |
+| payload | jsonb | | the response, stored unchanged |
 
 `UNIQUE (source, data_datetime)` is what makes the load idempotent: re-loading an hour addresses the
 row already there. Both key columns are therefore NOT NULL.
@@ -35,7 +35,7 @@ fetches, but nothing in the project needs to answer that yet.
 | sha256 | text | UQ | digest of the payload, hex |
 | first_seen | timestamptz | | 第一次看到這個版本的時間 |
 | fetched_datetime | timestamptz | | 最近一次看到這個版本的時間 |
-| json | jsonb | | the response, stored unchanged |
+| payload | jsonb | | the response, stored unchanged |
 
 `UNIQUE (source, sha256)` means a monthly fetch that finds nothing changed collides with the stored
 row, and only a real change inserts a new one. The table is therefore a version history of the
