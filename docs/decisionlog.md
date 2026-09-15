@@ -342,3 +342,31 @@ Two things follow. The process must still exit non-zero when any file failed, or
 reason to retry. And it must name the periods that failed, or the caller has no way to know what to
 retry.
 
+### Missing input is not a load failure
+
+A period with no landed file and a period that would not go into the database are reported
+separately, to two files, and only the second sets a non-zero exit code.
+
+The remedy differs. A load that failed is usually transient, a dropped connection or a lock, and
+running it again is likely to work. A period the extractor never landed will fail identically for
+ever: it has to be fetched before it can be loaded, and for an hourly feed it may no longer be
+fetchable at all. Telling the operator to retry the second kind is advice that cannot work.
+
+The backfill in step 5 is what forces the distinction. A year is more than eight thousand hours, and
+the air quality feed has already gone three days without updating once. If every gap counted as a
+failure, a backfill would end with thousands of them and a non-zero exit, and the signal would be
+worth nothing.
+
+The loader cannot say *why* a period is missing: it sees only the absence. Whether the API returned
+no data, or timed out, or was never asked, is known at fetch time and is currently only logged.
+Recording it properly needs the extractor to take a period argument, which is itself a prerequisite
+for the backfill, so it belongs to step 5 rather than here.
+
+### Periods that have not happened yet
+
+A period in the future is refused before anything else happens, and the run exits with a usage error.
+
+Without the check it is indistinguishable from a real gap: a mistyped year and an hour the feed
+genuinely skipped both end as "no file for that period". The current period is allowed through,
+because a feed running behind leaves it empty and that is a gap, not a typo.
+

@@ -40,6 +40,16 @@ from aqi_pipeline.sources import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_FAILED_FILE = Path("failed.txt")
+DEFAULT_MISSING_FILE = Path("missing.txt")
+
+
+class MissingInput(Exception):
+    """No file was landed for this period.
+
+    Separate from every other failure because the remedy is different. A load
+    that failed can be run again; a period the extractor never landed will fail
+    the same way for ever, and has to be fetched before it can be loaded.
+    """
 
 # The named constraints come from sql/002_create_raw_tables.sql. Naming them
 # means the conflict target reads as an intention rather than a column list.
@@ -84,6 +94,25 @@ def format_period(source: Source, stamp: datetime) -> str:
     return f"{stamp:%Y-%m-%dT%H}"
 
 
+def reject_if_future(source: Source, stamp: datetime) -> datetime:
+    """Refuse a period that has not happened yet.
+
+    A period in the future is a typo, not a data condition, and without this it
+    is indistinguishable from a genuine gap: both end as "no file for that
+    period". The current hour is allowed, because a feed that is running behind
+    leaves the current hour empty and that is a gap, not a typo.
+    """
+    now = datetime.now(tz=TAIPEI)
+    limit = (
+        now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if source.granularity == "month"
+        else now.replace(minute=0, second=0, microsecond=0)
+    )
+    if stamp > limit:
+        raise ValueError(f"{format_period(source, stamp)} has not happened yet")
+    return stamp
+
+
 def periods_from_args(source: Source, args: argparse.Namespace) -> list[datetime]:
     """Work out which periods this run covers.
 
@@ -92,10 +121,10 @@ def periods_from_args(source: Source, args: argparse.Namespace) -> list[datetime
     source's own granularity.
     """
     if args.period:
-        return [parse_period(source, text) for text in args.period]
+        return [reject_if_future(source, parse_period(source, text)) for text in args.period]
 
-    start = parse_period(source, args.start)
-    end = parse_period(source, args.end)
+    start = reject_if_future(source, parse_period(source, args.start))
+    end = reject_if_future(source, parse_period(source, args.end))
     if end < start:
         raise ValueError(f"--to {args.end} is before --from {args.start}")
 
@@ -119,7 +148,7 @@ def load_one(conn: psycopg.Connection, source: Source, stamp: datetime, root: Pa
     """
     payload_path = target_path(root, source, stamp)
     if not payload_path.exists():
-        raise FileNotFoundError(payload_path)
+        raise MissingInput(payload_path)
 
     metadata = read_metadata(metadata_path(payload_path))
     fetched_at = datetime.fromisoformat(metadata["fetched_at"])
@@ -157,7 +186,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--failed-file",
         type=Path,
         default=DEFAULT_FAILED_FILE,
-        help=f"where the periods that failed are written (default: {DEFAULT_FAILED_FILE})",
+        help=f"where periods that failed to load are written (default: {DEFAULT_FAILED_FILE})",
+    )
+    parser.add_argument(
+        "--missing-file",
+        type=Path,
+        default=DEFAULT_MISSING_FILE,
+        help=f"where periods with no landed file are written (default: {DEFAULT_MISSING_FILE})",
     )
     args = parser.parse_args(argv)
 
@@ -168,12 +203,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def write_periods(path: Path, source: Source, stamps: list[datetime]) -> None:
+    """Write a list of periods in the form the command line accepts.
+
+    Always written, even when empty, so that a file left over from an earlier
+    run cannot be mistaken for this one's result.
+    """
+    body = "".join(f"{format_period(source, stamp)}\n" for stamp in stamps)
+    path.write_text(body)
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Load every period asked for and report which ones did not land.
+    """Load every period asked for and report what did not land.
 
     Each period is its own transaction, so one bad file does not undo the ones
-    already committed. The failures are written to a file in the form the
-    command line accepts, so that a retry is the same command with that file.
+    already committed.
+
+    Two outcomes are kept apart. A period the extractor never landed is missing
+    input: loading it again will fail identically, and it has to be fetched
+    first. Anything else is a load failure, which is usually transient and worth
+    running again. Only load failures set a non-zero exit code, because a gap in
+    the landing zone is not something this step can fix, and during a backfill
+    gaps are expected in numbers that would otherwise drown the signal.
     """
     args = parse_args(argv)
     source = SOURCES[args.source]
@@ -190,36 +241,51 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("DATABASE_URL is not set; copy .env.example to .env")
         return 2
 
-    # Truncated up front so that a crash cannot leave yesterday's failures behind.
-    args.failed_file.write_text("")
-
+    missing: list[datetime] = []
     failures: list[datetime] = []
+    loaded = 0
+
     with psycopg.connect(dsn) as conn:
         for stamp in periods:
             label = format_period(source, stamp)
             try:
                 with conn.transaction():
                     load_one(conn, source, stamp, args.landing_root)
+            except MissingInput as error:
+                logger.warning("no landed file period=%s path=%s", label, error)
+                missing.append(stamp)
             except Exception as error:
                 logger.error("failed period=%s %s: %s", label, type(error).__name__, error)
                 failures.append(stamp)
             else:
+                loaded += 1
                 logger.info("loaded source=%s period=%s", source.name, label)
 
-    if failures:
-        args.failed_file.write_text(
-            "\n".join(format_period(source, stamp) for stamp in failures) + "\n"
+    write_periods(args.missing_file, source, missing)
+    write_periods(args.failed_file, source, failures)
+
+    flag = "month" if source.granularity == "month" else "hour"
+    logger.info(
+        "%d of %d periods loaded, %d missing, %d failed",
+        loaded,
+        len(periods),
+        len(missing),
+        len(failures),
+    )
+    if missing:
+        logger.warning(
+            "%d periods have no landed file; they need fetching, not reloading. see %s",
+            len(missing),
+            args.missing_file,
         )
+    if failures:
         logger.error(
-            "%d of %d periods failed; retry with --%s $(cat %s)",
+            "%d periods failed to load; retry with --%s $(cat %s)",
             len(failures),
-            len(periods),
-            "month" if source.granularity == "month" else "hour",
+            flag,
             args.failed_file,
         )
         return 1
-
-    logger.info("loaded %d periods with no failures", len(periods))
     return 0
 
 

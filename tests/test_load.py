@@ -11,7 +11,15 @@ from datetime import datetime
 
 import pytest
 
-from aqi_pipeline.load import format_period, parse_args, parse_period, periods_from_args
+from aqi_pipeline import load as load_module
+from aqi_pipeline.load import (
+    MissingInput,
+    format_period,
+    load_one,
+    parse_args,
+    parse_period,
+    periods_from_args,
+)
 from aqi_pipeline.sources import SOURCES, TAIPEI
 
 HOURLY = SOURCES["moenv_hourly"]
@@ -60,24 +68,24 @@ def test_a_range_of_one_hour_is_that_hour() -> None:
 
 def test_an_hourly_range_crosses_midnight_and_the_month_end() -> None:
     assert periods(
-        ["--source", "moenv_hourly", "--from", "2026-09-30T23", "--to", "2026-10-01T01"]
-    ) == ["2026-09-30T23", "2026-10-01T00", "2026-10-01T01"]
+        ["--source", "moenv_hourly", "--from", "2026-08-31T23", "--to", "2026-09-01T01"]
+    ) == ["2026-08-31T23", "2026-09-01T00", "2026-09-01T01"]
 
 
 def test_a_monthly_range_steps_one_month_at_a_time_across_a_year_end() -> None:
     """A month is not a fixed number of days, so stepping it needs care."""
     assert periods(
-        ["--source", "moenv_stations", "--month", "2026-11"]
-    ) == ["2026-11"]
+        ["--source", "moenv_stations", "--month", "2025-11"]
+    ) == ["2025-11"]
     assert periods(
-        ["--source", "moenv_stations", "--from", "2026-11", "--to", "2027-02"]
-    ) == ["2026-11", "2026-12", "2027-01", "2027-02"]
+        ["--source", "moenv_stations", "--from", "2025-11", "--to", "2026-02"]
+    ) == ["2025-11", "2025-12", "2026-01", "2026-02"]
 
 
 def test_a_monthly_range_does_not_skip_february() -> None:
     assert periods(
-        ["--source", "moenv_stations", "--from", "2027-01", "--to", "2027-04"]
-    ) == ["2027-01", "2027-02", "2027-03", "2027-04"]
+        ["--source", "moenv_stations", "--from", "2026-01", "--to", "2026-04"]
+    ) == ["2026-01", "2026-02", "2026-03", "2026-04"]
 
 
 def test_a_backwards_range_is_refused() -> None:
@@ -107,3 +115,156 @@ def test_bad_command_lines_are_refused(argv: list[str]) -> None:
     """argparse exits rather than raising, so the test looks for SystemExit."""
     with pytest.raises(SystemExit):
         parse_args(argv)
+
+
+# --- periods that have not happened yet ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--source", "moenv_hourly", "--hour", "2099-01-01T00"],
+        ["--source", "moenv_stations", "--month", "2099-01"],
+        ["--source", "moenv_hourly", "--from", "2026-09-11T20", "--to", "2099-01-01T00"],
+    ],
+)
+def test_a_period_in_the_future_is_refused(argv: list[str]) -> None:
+    """A typo must not look like a genuine gap; both end as "no file"."""
+    args = parse_args(argv)
+    with pytest.raises(ValueError) as error:
+        periods_from_args(SOURCES[args.source], args)
+    assert "has not happened yet" in str(error.value)
+
+
+def test_the_current_hour_is_allowed() -> None:
+    """A feed running behind leaves the current hour empty. That is a gap."""
+    now = datetime.now(tz=TAIPEI).replace(minute=0, second=0, microsecond=0)
+    args = parse_args(["--source", "moenv_hourly", "--hour", format_period(HOURLY, now)])
+    assert periods_from_args(HOURLY, args) == [now]
+
+
+# --- missing input is not a load failure -----------------------------------
+
+
+class FakeTransaction:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FakeConnection:
+    """Enough of a psycopg connection for the loop in main.
+
+    Rollback is not simulated here; that belongs in an integration test against
+    a real database. What this pins is which outcome each period is counted as.
+    """
+
+    def __init__(self, fail_on: set[str] | None = None) -> None:
+        self.fail_on = fail_on or set()
+        self.executed: list[tuple] = []
+
+    def execute(self, sql: str, params: tuple):
+        if params[1] in self.fail_on or str(params[1]) in self.fail_on:
+            raise RuntimeError("deadlock detected")
+        self.executed.append(params)
+
+    def transaction(self):
+        return FakeTransaction()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.fixture
+def landed(tmp_path: Path):
+    """Land one real payload and its sidecar, for hour 21 only."""
+
+    def land(stamp: datetime) -> None:
+        from aqi_pipeline.sources import build_metadata, metadata_path, target_path
+
+        payload = b'[{"publishtime": "2026/09/11 21:00:00"}]'
+        path = target_path(tmp_path, HOURLY, stamp)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        metadata_path(path).write_bytes(build_metadata(HOURLY, payload, stamp))
+
+    land(datetime(2026, 9, 11, 21, tzinfo=TAIPEI))
+    return tmp_path
+
+
+def run_load(monkeypatch, tmp_path: Path, argv: list[str], conn: FakeConnection) -> int:
+    monkeypatch.setattr(load_module, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused")
+    monkeypatch.setattr(load_module.psycopg, "connect", lambda dsn: conn)
+    return load_module.main(
+        argv
+        + [
+            "--landing-root", str(tmp_path),
+            "--missing-file", str(tmp_path / "missing.txt"),
+            "--failed-file", str(tmp_path / "failed.txt"),
+        ]
+    )
+
+
+def test_load_one_raises_missing_input_when_nothing_was_landed(tmp_path: Path) -> None:
+    with pytest.raises(MissingInput):
+        load_one(FakeConnection(), HOURLY, datetime(2026, 9, 11, 20, tzinfo=TAIPEI), tmp_path)
+
+
+def test_a_gap_in_a_range_does_not_fail_the_run(monkeypatch, landed: Path) -> None:
+    """During a backfill gaps are expected, and would otherwise drown the signal."""
+    conn = FakeConnection()
+    code = run_load(
+        monkeypatch,
+        landed,
+        ["--source", "moenv_hourly", "--from", "2026-09-11T20", "--to", "2026-09-11T23"],
+        conn,
+    )
+    assert code == 0
+    assert len(conn.executed) == 1
+    assert (landed / "missing.txt").read_text().split() == [
+        "2026-09-11T20",
+        "2026-09-11T22",
+        "2026-09-11T23",
+    ]
+    assert (landed / "failed.txt").read_text() == ""
+
+
+def test_a_load_failure_does_fail_the_run(monkeypatch, landed: Path) -> None:
+    conn = FakeConnection(fail_on={"2026-09-11 21:00:00+08:00"})
+    code = run_load(
+        monkeypatch, landed, ["--source", "moenv_hourly", "--hour", "2026-09-11T21"], conn
+    )
+    assert code == 1
+    assert (landed / "failed.txt").read_text().split() == ["2026-09-11T21"]
+    assert (landed / "missing.txt").read_text() == ""
+
+
+def test_the_two_outcomes_are_reported_separately(monkeypatch, landed: Path) -> None:
+    """A gap needs fetching; a failure needs running again. Never the same list."""
+    conn = FakeConnection(fail_on={"2026-09-11 21:00:00+08:00"})
+    code = run_load(
+        monkeypatch,
+        landed,
+        ["--source", "moenv_hourly", "--from", "2026-09-11T20", "--to", "2026-09-11T21"],
+        conn,
+    )
+    assert code == 1
+    assert (landed / "missing.txt").read_text().split() == ["2026-09-11T20"]
+    assert (landed / "failed.txt").read_text().split() == ["2026-09-11T21"]
+
+
+def test_the_lists_are_truncated_when_a_rerun_succeeds(monkeypatch, landed: Path) -> None:
+    """A file left from an earlier run must not be read as this run's result."""
+    (landed / "failed.txt").write_text("2026-09-11T20\n")
+    conn = FakeConnection()
+    code = run_load(
+        monkeypatch, landed, ["--source", "moenv_hourly", "--hour", "2026-09-11T21"], conn
+    )
+    assert code == 0
+    assert (landed / "failed.txt").read_text() == ""
