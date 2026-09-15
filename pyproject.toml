@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "psycopg[binary]>=3.3.5",
     "python-dotenv>=1.2.1",
     "requests>=2.32.5",
 ]
@@ -18,3 +19,8 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-name = "aqi_pipeline"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

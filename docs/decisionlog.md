@@ -304,6 +304,35 @@ nothing notices a period that was never requested. That needs a separate reconci
 comparing the files present against the rows in `raw`. Still to decide: whether it runs as its own
 step or as one of the data quality tests.
 
+### Naming the period
+
+Two ways of saying which period to load, because they are two different jobs.
+
+`--hour` takes one or more hours. It covers the routine load, where the caller knows the hour it is
+running for, and it covers a re-run of specific hours. `--from` and `--to` take a range, which is
+what a backfill needs and what would be tedious to express as a list of hours.
+
+Keeping them as separate flags rather than one flag that accepts both forms costs a little argument
+validation, but a reader of the command line can see immediately which job is being asked for.
+
+### Where data_datetime comes from
+
+From the landing-zone path, not from re-reading `publishtime` inside the payload.
+
+The path is how the whole system addresses a file. It is what `--hour` names, what a repeat fetch
+overwrites, and what a re-run has to land on again. If the loader took the hour from the payload
+instead, the row could be stored under an hour different from the one the caller asked to load, and
+the address and the stored key would disagree.
+
+The two can only differ if the code that derived the path is not the code now reading the payload:
+extract writes the path from the payload, so they agree at the moment of writing. A later change to
+how the hour is read, a timezone fix or a change from taking the latest timestamp to the earliest,
+would leave old files whose paths no longer match what today's code would derive. A file moved by
+hand would do the same.
+
+Still to decide: whether the loader re-derives the hour and warns when it disagrees with the path.
+The check is not free, because storing the payload does not otherwise require parsing it in Python.
+
 ### Partial failure
 
 When a run covers several periods and one of them fails, the successful ones stay committed and only

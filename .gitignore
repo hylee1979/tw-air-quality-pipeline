@@ -4,5 +4,6 @@ __pycache__/
 .env
 *.env
 /data/
+failed.txt
 
 PLAN.md
